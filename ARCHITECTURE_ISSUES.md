@@ -211,10 +211,11 @@ const agentsInConfig: OpenClawAgent[] = config.agents?.list || []
 ## 📋 COMPREHENSIVE FIX ROADMAP
 
 ### Phase 1: Foundation Fixes (Required First)
-1. **Multi-workspace discovery**
-   - Scan `.openclaw/workspace-*` directories
-   - Map agents to workspaces
-   - Update Memory Browser with workspace selector
+1. **✅ DONE: Multi-workspace discovery**
+   - ~~Scan `.openclaw/workspace-*` directories~~
+   - ~~Map agents to workspaces~~
+   - ~~Update Memory Browser with workspace selector~~
+   - **Status:** Complete - discovers 21 workspaces, unified tree API working
 
 2. **Dynamic model catalog**
    - Parse `openclaw.json` models at startup
