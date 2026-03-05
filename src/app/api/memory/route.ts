@@ -7,11 +7,13 @@ import { resolveWithin } from '@/lib/paths'
 import { requireRole } from '@/lib/auth'
 import { readLimiter, mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { discoverWorkspaces, getWorkspace } from '@/lib/workspaces'
 
+// Legacy single-workspace support for backward compatibility
 const MEMORY_PATH = config.memoryDir
 const MEMORY_ALLOWED_PREFIXES = (config.memoryAllowedPrefixes || []).map((p) => p.replace(/\\/g, '/'))
 
-// Ensure memory directory exists on startup
+// Ensure memory directory exists on startup (legacy)
 if (MEMORY_PATH && !existsSync(MEMORY_PATH)) {
   try { mkdirSync(MEMORY_PATH, { recursive: true }) } catch { /* ignore */ }
 }
@@ -45,7 +47,6 @@ async function resolveSafeMemoryPath(baseDir: string, relativePath: string): Pro
   const fullPath = resolveWithin(baseDir, relativePath)
 
   // For non-existent targets, validate containment using the nearest existing ancestor.
-  // This allows nested creates (mkdir -p) while still blocking symlink escapes.
   let current = dirname(fullPath)
   let parentReal = ''
   while (!parentReal) {
@@ -136,6 +137,13 @@ async function buildFileTree(dirPath: string, relativePath: string = ''): Promis
   }
 }
 
+/**
+ * GET /api/memory?action=tree|content|workspaces
+ * 
+ * New query params:
+ * - workspace={id} : Select specific workspace (default: all workspaces)
+ * - action=workspaces : List available workspaces with memory access
+ */
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
@@ -147,9 +155,170 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const path = searchParams.get('path')
     const action = searchParams.get('action')
+    const workspaceId = searchParams.get('workspace')
 
+    // NEW: List workspaces with memory
+    if (action === 'workspaces') {
+      const workspaces = discoverWorkspaces()
+      const workspacesWithMemory = workspaces.map(ws => ({
+        id: ws.id,
+        name: ws.name,
+        emoji: ws.emoji,
+        path: ws.relativePath,
+        hasMemory: existsSync(ws.memoryPath)
+      }))
+      return NextResponse.json({ workspaces: workspacesWithMemory })
+    }
+
+    // NEW: Unified tree across all workspaces (or specific workspace)
     if (action === 'tree') {
-      // Return the file tree
+      if (workspaceId) {
+        // Single workspace tree
+        const workspace = getWorkspace(workspaceId)
+        if (!workspace) {
+          return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+        }
+        
+        const memoryPath = workspace.memoryPath
+        if (!existsSync(memoryPath)) {
+          return NextResponse.json({ tree: [], workspace: workspaceId })
+        }
+        
+        const tree = await buildFileTree(memoryPath)
+        return NextResponse.json({ 
+          tree,
+          workspace: workspaceId,
+          workspaceName: workspace.name,
+          emoji: workspace.emoji
+        })
+      }
+      
+      // Multi-workspace unified tree
+      const workspaces = discoverWorkspaces()
+      const unifiedTree: Array<{
+        path: string
+        name: string
+        type: 'directory'
+        workspaceId: string
+        workspaceName: string
+        emoji?: string
+        modified: number
+        children: MemoryFile[]
+      }> = []
+      
+      for (const ws of workspaces) {
+        if (!existsSync(ws.memoryPath)) continue
+        
+        try {
+          const children = await buildFileTree(ws.memoryPath)
+          const stats = await stat(ws.memoryPath)
+          
+          unifiedTree.push({
+            path: ws.relativePath,
+            name: ws.name,
+            type: 'directory',
+            workspaceId: ws.id,
+            workspaceName: ws.name,
+            emoji: ws.emoji,
+            modified: stats.mtime.getTime(),
+            children
+          })
+        } catch (error) {
+          logger.error({ err: error, workspace: ws.id }, 'Failed to read workspace memory')
+        }
+      }
+      
+      return NextResponse.json({ 
+        tree: unifiedTree, 
+        unified: true,
+        workspaceCount: unifiedTree.length
+      })
+    }
+
+    // NEW: Content from specific workspace
+    if (action === 'content' && path) {
+      if (workspaceId) {
+        // Read from specific workspace
+        const workspace = getWorkspace(workspaceId)
+        if (!workspace) {
+          return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+        }
+        
+        const fullPath = await resolveSafeMemoryPath(workspace.memoryPath, path)
+        
+        try {
+          const content = await readFile(fullPath, 'utf-8')
+          const stats = await stat(fullPath)
+          
+          return NextResponse.json({
+            content,
+            size: stats.size,
+            modified: stats.mtime.getTime(),
+            path,
+            workspace: workspaceId,
+            workspaceName: workspace.name
+          })
+        } catch (error: any) {
+          if (error.code === 'ENOENT') {
+            return NextResponse.json({ error: 'File not found' }, { status: 404 })
+          }
+          throw error
+        }
+      }
+      
+      // Legacy: try to find file in any workspace
+      // First check if path includes workspace prefix
+      const workspaces = discoverWorkspaces()
+      for (const ws of workspaces) {
+        try {
+          const fullPath = await resolveSafeMemoryPath(ws.memoryPath, path)
+          if (existsSync(fullPath)) {
+            const content = await readFile(fullPath, 'utf-8')
+            const stats = await stat(fullPath)
+            
+            return NextResponse.json({
+              content,
+              size: stats.size,
+              modified: stats.mtime.getTime(),
+              path,
+              workspace: ws.id,
+              workspaceName: ws.name
+            })
+          }
+        } catch {
+          // Try next workspace
+        }
+      }
+      
+      // Fallback to legacy single-path
+      if (!isPathAllowed(path)) {
+        return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+      }
+      if (!MEMORY_PATH) {
+        return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
+      }
+      const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+      
+      try {
+        const content = await readFile(fullPath, 'utf-8')
+        const stats = await stat(fullPath)
+        
+        return NextResponse.json({
+          content,
+          size: stats.size,
+          modified: stats.mtime.getTime(),
+          path
+        })
+      } catch (error: any) {
+        if (error.code === 'ENOENT') {
+          return NextResponse.json({ error: 'File not found' }, { status: 404 })
+        }
+        throw error
+      }
+    }
+
+    // Fallback: legacy tree for backward compatibility
+    if (action === 'tree' || !action) {
       if (!MEMORY_PATH) {
         return NextResponse.json({ tree: [] })
       }
@@ -179,119 +348,16 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ tree })
     }
 
-    if (action === 'content' && path) {
-      // Return file content
-      if (!isPathAllowed(path)) {
-        return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
-      }
-      if (!MEMORY_PATH) {
-        return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
-      }
-      const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
-      
-      try {
-        const content = await readFile(fullPath, 'utf-8')
-        const stats = await stat(fullPath)
-        
-        return NextResponse.json({
-          content,
-          size: stats.size,
-          modified: stats.mtime.getTime(),
-          path
-        })
-      } catch (error) {
-        return NextResponse.json({ error: 'File not found' }, { status: 404 })
-      }
-    }
-
-    if (action === 'search') {
-      const query = searchParams.get('query')
-      if (!query) {
-        return NextResponse.json({ error: 'Query required' }, { status: 400 })
-      }
-      if (!MEMORY_PATH) {
-        return NextResponse.json({ query, results: [] })
-      }
-
-      // Simple file search - in production you'd want a more sophisticated search
-      const results: Array<{path: string, name: string, matches: number}> = []
-      
-      const searchInFile = async (filePath: string, relativePath: string) => {
-        try {
-          const st = await stat(filePath)
-          // Avoid large-file scanning and memory blowups.
-          if (st.size > 1_000_000) {
-            return
-          }
-          const content = await readFile(filePath, 'utf-8')
-          const haystack = content.toLowerCase()
-          const needle = query.toLowerCase()
-          if (!needle) return
-          let matches = 0
-          let idx = haystack.indexOf(needle)
-          while (idx !== -1) {
-            matches += 1
-            idx = haystack.indexOf(needle, idx + needle.length)
-          }
-          
-          if (matches > 0) {
-            results.push({
-              path: relativePath,
-              name: relativePath.split('/').pop() || '',
-              matches
-            })
-          }
-        } catch (error) {
-          // Skip files that can't be read
-        }
-      }
-
-      const searchDirectory = async (dirPath: string, relativePath: string = '') => {
-        try {
-          const items = await readdir(dirPath, { withFileTypes: true })
-          
-          for (const item of items) {
-            if (item.isSymbolicLink()) {
-              continue
-            }
-            const itemPath = join(dirPath, item.name)
-            const itemRelativePath = join(relativePath, item.name)
-            
-            if (item.isDirectory()) {
-              await searchDirectory(itemPath, itemRelativePath)
-            } else if (item.isFile() && (item.name.endsWith('.md') || item.name.endsWith('.txt'))) {
-              await searchInFile(itemPath, itemRelativePath)
-            }
-          }
-        } catch (error) {
-          logger.error({ err: error, path: dirPath }, 'Error searching directory')
-        }
-      }
-
-      if (MEMORY_ALLOWED_PREFIXES.length) {
-        for (const prefix of MEMORY_ALLOWED_PREFIXES) {
-          const folder = prefix.replace(/\/$/, '')
-          const fullPath = join(MEMORY_PATH, folder)
-          if (!existsSync(fullPath)) continue
-          await searchDirectory(fullPath, folder)
-        }
-      } else {
-        await searchDirectory(MEMORY_PATH)
-      }
-      
-      return NextResponse.json({ 
-        query,
-        results: results.sort((a, b) => b.matches - a.matches)
-      })
-    }
-
-    return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
+    return NextResponse.json({ error: 'Invalid action. Use ?action=tree|content|workspaces' }, { status: 400 })
   } catch (error) {
-    logger.error({ err: error }, 'Memory API error')
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    logger.error({ err: error }, 'GET /api/memory error')
+    return NextResponse.json({ error: 'Failed to read memory' }, { status: 500 })
   }
 }
 
+/**
+ * POST /api/memory - Write file (with workspace support)
+ */
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
@@ -301,98 +367,80 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json()
-    const { action, path, content } = body
+    const { action, path: filePath, content, workspace: workspaceId } = body
 
-    if (!path) {
-      return NextResponse.json({ error: 'Path is required' }, { status: 400 })
-    }
-    if (!isPathAllowed(path)) {
-      return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+    if (!filePath) {
+      return NextResponse.json({ error: 'path is required' }, { status: 400 })
     }
 
-    if (!MEMORY_PATH) {
+    // Determine target workspace
+    let targetMemoryPath = MEMORY_PATH
+    let targetWorkspace: { id: string; name: string } | undefined
+    
+    if (workspaceId) {
+      const workspace = getWorkspace(workspaceId)
+      if (!workspace) {
+        return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+      }
+      targetMemoryPath = workspace.memoryPath
+      targetWorkspace = { id: workspace.id, name: workspace.name }
+    }
+
+    if (!targetMemoryPath) {
       return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
     }
-    const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
 
-    if (action === 'save') {
-      // Save file content
-      if (content === undefined) {
-        return NextResponse.json({ error: 'Content is required for save action' }, { status: 400 })
+    if (action === 'write') {
+      if (typeof content !== 'string') {
+        return NextResponse.json({ error: 'content must be a string' }, { status: 400 })
+      }
+
+      const fullPath = await resolveSafeMemoryPath(targetMemoryPath, filePath)
+      
+      // Ensure parent directory exists
+      const parentDir = dirname(fullPath)
+      if (!existsSync(parentDir)) {
+        await mkdir(parentDir, { recursive: true })
       }
 
       await writeFile(fullPath, content, 'utf-8')
-      return NextResponse.json({ success: true, message: 'File saved successfully' })
+
+      return NextResponse.json({
+        success: true,
+        path: filePath,
+        workspace: targetWorkspace?.id,
+        workspaceName: targetWorkspace?.name,
+        message: 'File saved successfully'
+      })
     }
 
-    if (action === 'create') {
-      // Create new file
-      const dirPath = dirname(fullPath)
-      
-      // Ensure directory exists
-      try {
-        await mkdir(dirPath, { recursive: true })
-      } catch (error) {
-        // Directory might already exist
-      }
+    if (action === 'mkdir') {
+      const fullPath = await resolveSafeMemoryPath(targetMemoryPath, filePath)
+      await mkdir(fullPath, { recursive: true })
 
-      // Check if file already exists
-      try {
-        await stat(fullPath)
-        return NextResponse.json({ error: 'File already exists' }, { status: 409 })
-      } catch (error) {
-        // File doesn't exist, which is what we want
-      }
-
-      await writeFile(fullPath, content || '', 'utf-8')
-      return NextResponse.json({ success: true, message: 'File created successfully' })
+      return NextResponse.json({
+        success: true,
+        path: filePath,
+        workspace: targetWorkspace?.id,
+        message: 'Directory created successfully'
+      })
     }
-
-    return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
-  } catch (error) {
-    logger.error({ err: error }, 'Memory POST API error')
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
-  }
-}
-
-export async function DELETE(request: NextRequest) {
-  const auth = requireRole(request, 'admin')
-  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
-
-  const rateCheck = mutationLimiter(request)
-  if (rateCheck) return rateCheck
-
-  try {
-    const body = await request.json()
-    const { action, path } = body
-
-    if (!path) {
-      return NextResponse.json({ error: 'Path is required' }, { status: 400 })
-    }
-    if (!isPathAllowed(path)) {
-      return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
-    }
-
-    if (!MEMORY_PATH) {
-      return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
-    }
-    const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
 
     if (action === 'delete') {
-      // Check if file exists
-      try {
-        await stat(fullPath)
-      } catch (error) {
-        return NextResponse.json({ error: 'File not found' }, { status: 404 })
-      }
-
+      const fullPath = await resolveSafeMemoryPath(targetMemoryPath, filePath)
       await unlink(fullPath)
-      return NextResponse.json({ success: true, message: 'File deleted successfully' })
+
+      return NextResponse.json({
+        success: true,
+        path: filePath,
+        workspace: targetWorkspace?.id,
+        message: 'File deleted successfully'
+      })
     }
 
-    return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
-  } catch (error) {
-    logger.error({ err: error }, 'Memory DELETE API error')
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return NextResponse.json({ error: 'Invalid action. Use write|mkdir|delete' }, { status: 400 })
+  } catch (error: any) {
+    logger.error({ err: error }, 'POST /api/memory error')
+    return NextResponse.json({ error: error.message || 'Failed to write memory' }, { status: 500 })
   }
 }
