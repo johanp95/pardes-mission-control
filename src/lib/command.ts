@@ -74,7 +74,15 @@ export function runCommand(
 export function runOpenClaw(args: string[], options: CommandOptions = {}) {
   return runCommand(config.openclawBin, args, {
     ...options,
-    cwd: options.cwd || config.openclawStateDir || process.cwd()
+    cwd: options.cwd || config.openclawStateDir || process.cwd(),
+    // Ensure OpenClaw CLI resolves the correct state directory.
+    // OPENCLAW_HOME is treated as a parent dir by the CLI (appends /.openclaw),
+    // while OPENCLAW_STATE_DIR points directly to the state dir.
+    env: {
+      ...process.env,
+      ...options.env,
+      OPENCLAW_STATE_DIR: config.openclawStateDir,
+    },
   })
 }
 

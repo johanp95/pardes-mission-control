@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { runClawdbot } from '@/lib/command'
+import { runOpenClaw } from '@/lib/command'
 import { requireRole } from '@/lib/auth'
 import { config } from '@/lib/config'
 import { readdir, readFile, stat } from 'fs/promises'
@@ -8,13 +8,32 @@ import { heavyLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, spawnAgentSchema } from '@/lib/validation'
 
-function getPreferredToolsProfile(): string {
-  return String(process.env.OPENCLAW_TOOLS_PROFILE || 'coding').trim() || 'coding'
-}
-
-async function runSpawnWithCompatibility(spawnPayload: Record<string, unknown>) {
-  const commandArg = `sessions_spawn(${JSON.stringify(spawnPayload)})`
-  return runClawdbot(['-c', commandArg], { timeoutMs: 10000 })
+/**
+ * Spawn an agent by sending a message via `openclaw agent`.
+ *
+ * This creates (or resumes) an agent session on the Gateway and delivers
+ * the task message.  The Gateway then runs the agent turn with the
+ * configured model.
+ */
+async function runAgentSpawn(opts: {
+  agentId: string
+  task: string
+  model?: string
+  timeout?: number
+}) {
+  const args: string[] = [
+    'agent',
+    '--agent', opts.agentId,
+    '--message', opts.task,
+    '--json',
+  ]
+  if (opts.timeout) {
+    args.push('--timeout', String(opts.timeout))
+  }
+  // Note: model selection is handled by the agent's configured default_model
+  // in openclaw.json.  The `openclaw agent` CLI doesn't accept a --model flag
+  // for overriding at spawn-time; model config lives in agent defaults.
+  return runOpenClaw(args, { timeoutMs: (opts.timeout || 300) * 1000 + 5000 })
 }
 
 export async function POST(request: NextRequest) {
@@ -29,104 +48,77 @@ export async function POST(request: NextRequest) {
     if ('error' in result) return result.error
     const { task, model, label, timeoutSeconds } = result.data
 
-    const timeout = timeoutSeconds
-
-    // Generate spawn ID
     const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 
-    // Construct the spawn command
-    // Using OpenClaw's sessions_spawn function via clawdbot CLI
-    const spawnPayload = {
-      task,
-      model,
-      label,
-      runTimeoutSeconds: timeout,
-      tools: {
-        profile: getPreferredToolsProfile(),
-      },
+    // `label` doubles as agent id in the UI.  Map common display names
+    // to their openclaw.json agent ids.
+    const AGENT_ALIASES: Record<string, string> = {
+      'Lumen': 'canvas-architect',
+      'Metaclaw': 'main',
+      'PaRDeS Dev': 'pardes-dev',
+      'OpenClaw Dev': 'openclaw-dev',
+      'Cognitron-AGE Dev': 'cognitron-age',
+      'Cortex Dev': 'cognitron-cortex',
+      'Protectron Dev': 'protectron-dev',
+      'Archivist': 'graph-consultant',
     }
 
+    const agentId = AGENT_ALIASES[label] || label.toLowerCase().replace(/\s+/g, '-')
+
     try {
-      // Execute the spawn command (OpenClaw 2026.3.2+ defaults tools.profile to messaging).
-      let stdout = ''
-      let stderr = ''
-      let compatibilityFallbackUsed = false
-      try {
-        const result = await runSpawnWithCompatibility(spawnPayload)
-        stdout = result.stdout
-        stderr = result.stderr
-      } catch (firstError: any) {
-        const rawErr = String(firstError?.stderr || firstError?.message || '').toLowerCase()
-        const likelySchemaMismatch =
-          rawErr.includes('unknown field') ||
-          rawErr.includes('unknown key') ||
-          rawErr.includes('invalid argument') ||
-          rawErr.includes('tools') ||
-          rawErr.includes('profile')
-        if (!likelySchemaMismatch) throw firstError
+      const { stdout, stderr } = await runAgentSpawn({
+        agentId,
+        task,
+        model,
+        timeout: timeoutSeconds,
+      })
 
-        const fallbackPayload = { ...spawnPayload }
-        delete (fallbackPayload as any).tools
-        const fallback = await runSpawnWithCompatibility(fallbackPayload)
-        stdout = fallback.stdout
-        stderr = fallback.stderr
-        compatibilityFallbackUsed = true
-      }
-
-      // Parse the response to extract session info
-      let sessionInfo = null
+      // Try to extract session key from JSON output
+      let sessionInfo: string | null = null
       try {
-        // Look for session information in stdout
-        const sessionMatch = stdout.match(/Session created: (.+)/)
-        if (sessionMatch) {
-          sessionInfo = sessionMatch[1]
-        }
-      } catch (parseError) {
-        logger.error({ err: parseError }, 'Failed to parse session info')
+        const parsed = JSON.parse(stdout)
+        sessionInfo = parsed.sessionKey || parsed.session_key || parsed.key || null
+      } catch {
+        // Try regex fallback
+        const match = stdout.match(/agent:[a-z0-9_-]+:[a-z0-9_-]+/i)
+        if (match) sessionInfo = match[0]
       }
 
       return NextResponse.json({
         success: true,
         spawnId,
         sessionInfo,
+        agentId,
         task,
         model,
         label,
-        timeoutSeconds: timeout,
+        timeoutSeconds,
         createdAt: Date.now(),
         stdout: stdout.trim(),
         stderr: stderr.trim(),
-        compatibility: {
-          toolsProfile: getPreferredToolsProfile(),
-          fallbackUsed: compatibilityFallbackUsed,
-        },
       })
-
     } catch (execError: any) {
-      logger.error({ err: execError }, 'Spawn execution error')
-      
+      logger.error({ err: execError, agentId }, 'Spawn execution error')
+
       return NextResponse.json({
         success: false,
         spawnId,
         error: execError.message || 'Failed to spawn agent',
+        agentId,
         task,
         model,
         label,
-        timeoutSeconds: timeout,
-        createdAt: Date.now()
+        timeoutSeconds,
+        createdAt: Date.now(),
       }, { status: 500 })
     }
-
   } catch (error) {
     logger.error({ err: error }, 'Spawn API error')
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
-// Get spawn history
+// ── GET: Spawn history (read from logs) ─────────────────────────
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
@@ -135,9 +127,6 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200)
 
-    // In a real implementation, you'd store spawn history in a database
-    // For now, we'll try to read recent spawn activity from logs
-    
     try {
       if (!config.logsDir) {
         return NextResponse.json({ history: [] })
@@ -159,12 +148,11 @@ export async function GET(request: NextRequest) {
         .slice(0, 5)
 
       const lines: string[] = []
-
       for (const log of recentLogs) {
         const content = await readFile(log.fullPath, 'utf-8')
         const matched = content
           .split('\n')
-          .filter((line) => line.includes('sessions_spawn'))
+          .filter((line) => line.includes('sessions_spawn') || line.includes('agent --agent'))
         lines.push(...matched)
       }
 
@@ -172,40 +160,27 @@ export async function GET(request: NextRequest) {
         .slice(-limit)
         .map((line, index) => {
           try {
-            const timestampMatch = line.match(
-              /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/
-            )
+            const timestampMatch = line.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/)
             const modelMatch = line.match(/model[:\s]+"([^"]+)"/)
             const taskMatch = line.match(/task[:\s]+"([^"]+)"/)
-
             return {
               id: `history-${Date.now()}-${index}`,
-              timestamp: timestampMatch
-                ? new Date(timestampMatch[1]).getTime()
-                : Date.now(),
+              timestamp: timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now(),
               model: modelMatch ? modelMatch[1] : 'unknown',
               task: taskMatch ? taskMatch[1] : 'unknown',
               status: 'completed',
-              line: line.trim()
+              line: line.trim(),
             }
-          } catch (parseError) {
-            return null
-          }
+          } catch { return null }
         })
         .filter(Boolean)
 
       return NextResponse.json({ history: spawnHistory })
-
-    } catch (logError) {
-      // If we can't read logs, return empty history
+    } catch {
       return NextResponse.json({ history: [] })
     }
-
   } catch (error) {
     logger.error({ err: error }, 'Spawn history API error')
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
