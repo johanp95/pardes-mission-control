@@ -18,18 +18,35 @@ export function AgentSpawnPanel() {
     availableModels, 
     spawnRequests, 
     addSpawnRequest, 
-    updateSpawnRequest 
+    updateSpawnRequest,
+    refreshModels
   } = useMissionControl()
 
   const [formData, setFormData] = useState<SpawnFormData>({
     task: '',
-    model: 'sonnet',
+    model: '',
     label: '',
     timeoutSeconds: 300
   })
 
   const [isSpawning, setIsSpawning] = useState(false)
   const [spawnHistory, setSpawnHistory] = useState<any[]>([])
+
+  // Load models on mount
+  useEffect(() => {
+    refreshModels()
+  }, [refreshModels])
+
+  // Set default model when availableModels loads
+  useEffect(() => {
+    if (availableModels.length > 0 && !formData.model) {
+      // Use primary model or first available
+      const primary = availableModels.find(m => 
+        m.name === 'moonshot/kimi-k2.5' || m.alias === 'kimi'
+      ) || availableModels[0]
+      setFormData(prev => ({ ...prev, model: primary.alias || primary.name }))
+    }
+  }, [availableModels, formData.model])
 
   useEffect(() => {
     // Load spawn history on mount
@@ -78,10 +95,11 @@ export function AgentSpawnPanel() {
           result: result.sessionInfo || 'Agent spawned successfully'
         })
 
-        // Clear form
+        // Clear form - use first available model as default
+        const defaultModel = availableModels[0]?.alias || availableModels[0]?.name || ''
         setFormData({
           task: '',
-          model: 'sonnet',
+          model: defaultModel,
           label: '',
           timeoutSeconds: 300
         })

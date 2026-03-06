@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import { MODEL_CATALOG } from '@/lib/models'
+// MODEL_CATALOG is now server-side only; client fetches from /api/models
 
 // Enhanced types for Mission Control
 export interface Session {
@@ -382,6 +382,7 @@ interface MissionControlStore {
   // Model Configuration
   availableModels: ModelConfig[]
   setAvailableModels: (models: ModelConfig[]) => void
+  refreshModels: () => Promise<void>
 
   // Agent Chat
   chatMessages: ChatMessage[]
@@ -578,9 +579,22 @@ export const useMissionControl = create<MissionControlStore>()(
         .reduce((acc, usage) => acc + usage.cost, 0)
     },
 
-    // Model Configuration
-    availableModels: [...MODEL_CATALOG],
+    // Model Configuration - fetched from /api/models
+    availableModels: [],
     setAvailableModels: (models) => set({ availableModels: models }),
+    refreshModels: async () => {
+      try {
+        const response = await fetch('/api/models')
+        if (response.ok) {
+          const data = await response.json()
+          if (data.models) {
+            set({ availableModels: data.models })
+          }
+        }
+      } catch (error) {
+        console.error('Failed to refresh models:', error)
+      }
+    },
 
     // Auth
     currentUser: null,
