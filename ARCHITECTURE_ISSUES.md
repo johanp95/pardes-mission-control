@@ -217,10 +217,10 @@ const agentsInConfig: OpenClawAgent[] = config.agents?.list || []
    - ~~Update Memory Browser with workspace selector~~
    - **Status:** Complete - discovers 21 workspaces, unified tree API working
 
-2. **Dynamic model catalog**
-   - Parse `openclaw.json` models at startup
-   - Watch file for changes
-   - Replace hardcoded MODEL_CATALOG
+2. **✅ DONE: Dynamic model catalog**
+   - ~~Parse `openclaw.json` models at startup~~
+   - ~~Replace hardcoded MODEL_CATALOG~~
+   - **Status:** Complete - API returns 4 moonshot models, spawn panel uses real config
 
 3. **Fix gateway health check**
    - Implement actual WebSocket ping
