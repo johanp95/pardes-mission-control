@@ -6,6 +6,14 @@ import { createClientLogger } from '@/lib/client-logger'
 
 const log = createClientLogger('MemoryBrowser')
 
+interface Workspace {
+  id: string
+  name: string
+  emoji?: string
+  path: string
+  hasMemory: boolean
+}
+
 interface MemoryFile {
   path: string
   name: string
@@ -13,6 +21,11 @@ interface MemoryFile {
   size?: number
   modified?: number
   children?: MemoryFile[]
+}
+
+interface WorkspaceWithFiles extends Workspace {
+  children: MemoryFile[]
+  modified: number
 }
 
 export function MemoryBrowserPanel() {
@@ -28,6 +41,8 @@ export function MemoryBrowserPanel() {
   const isLocal = dashboardMode === 'local'
 
   const [isLoading, setIsLoading] = useState(false)
+  const [workspaces, setWorkspaces] = useState<WorkspaceWithFiles[]>([])
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string | 'all'>('all')
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
   const [searchResults, setSearchResults] = useState<any[]>([])
   const [searchQuery, setSearchQuery] = useState('')
@@ -39,43 +54,86 @@ export function MemoryBrowserPanel() {
   const [isSaving, setIsSaving] = useState(false)
   const [activeTab, setActiveTab] = useState<'daily' | 'knowledge' | 'all'>('all')
 
-  const loadFileTree = useCallback(async () => {
+  // Load workspaces and their files
+  const loadWorkspaces = useCallback(async () => {
     setIsLoading(true)
     try {
+      // Fetch unified tree (all workspaces)
       const response = await fetch('/api/memory?action=tree')
       const data = await response.json()
-      setMemoryFiles(data.tree || [])
+      
+      if (data.unified && Array.isArray(data.tree)) {
+        // New format: tree is array of workspaces
+        setWorkspaces(data.tree)
+        setMemoryFiles(data.tree) // For backward compatibility
+      } else if (Array.isArray(data.tree)) {
+        // Legacy format: flat file tree
+        setWorkspaces([{
+          id: 'legacy',
+          name: 'Memory',
+          path: 'memory',
+          hasMemory: true,
+          children: data.tree,
+          modified: Date.now()
+        }])
+        setMemoryFiles(data.tree)
+      }
 
-      // Auto-expand some common directories
-      setExpandedFolders(new Set(['daily', 'knowledge', 'memory', 'knowledge-base']))
+      // Auto-expand all workspaces initially
+      const allPaths = new Set<string>()
+      data.tree?.forEach((ws: WorkspaceWithFiles) => {
+        allPaths.add(ws.path)
+        ws.children?.forEach((child: MemoryFile) => {
+          if (child.type === 'directory') {
+            allPaths.add(child.path)
+          }
+        })
+      })
+      setExpandedFolders(allPaths)
     } catch (error) {
-      log.error('Failed to load file tree:', error)
+      log.error('Failed to load workspaces:', error)
     } finally {
       setIsLoading(false)
     }
   }, [setMemoryFiles])
 
   useEffect(() => {
-    loadFileTree()
-  }, [loadFileTree])
+    loadWorkspaces()
+  }, [loadWorkspaces])
 
-  const getFilteredFiles = () => {
-    if (activeTab === 'all') return memoryFiles
+  // Get files to display based on selected workspace
+  const getDisplayFiles = (): WorkspaceWithFiles[] => {
+    let filtered = workspaces
 
-    const tabPrefixes = activeTab === 'daily'
-      ? ['daily/', 'memory/']
-      : ['knowledge/', 'knowledge-base/']
+    // Filter by workspace
+    if (selectedWorkspace !== 'all') {
+      filtered = workspaces.filter(ws => ws.id === selectedWorkspace)
+    }
 
-    return memoryFiles.filter((file) => {
-      const normalizedPath = `${file.path.replace(/\\/g, '/')}/`
-      return tabPrefixes.some((prefix) => normalizedPath.startsWith(prefix))
-    })
+    // Filter by tab (daily/knowledge)
+    if (activeTab !== 'all') {
+      filtered = filtered.map(ws => ({
+        ...ws,
+        children: ws.children?.filter(file => {
+          const normalizedPath = `${file.path.replace(/\\/g, '/')}/`.toLowerCase()
+          if (activeTab === 'daily') {
+            return normalizedPath.includes('memory/') || normalizedPath.match(/\d{4}-\d{2}-\d{2}/)
+          } else {
+            return normalizedPath.includes('knowledge') || !normalizedPath.match(/\d{4}-\d{2}-\d{2}/)
+          }
+        }) || []
+      }))
+    }
+
+    return filtered
   }
 
-  const loadFileContent = async (filePath: string) => {
+  const loadFileContent = async (filePath: string, workspaceId?: string) => {
     setIsLoading(true)
     try {
-      const response = await fetch(`/api/memory?action=content&path=${encodeURIComponent(filePath)}`)
+      // Include workspace if specified
+      const wsParam = workspaceId ? `&workspace=${encodeURIComponent(workspaceId)}` : ''
+      const response = await fetch(`/api/memory?action=content&path=${encodeURIComponent(filePath)}${wsParam}`)
       const data = await response.json()
       
       if (data.content !== undefined) {
@@ -118,16 +176,17 @@ export function MemoryBrowserPanel() {
     setExpandedFolders(newExpanded)
   }
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return '0 B'
+  const formatFileSize = (bytes?: number) => {
+    if (!bytes || bytes === 0) return '0 B'
     const k = 1024
     const sizes = ['B', 'KB', 'MB', 'GB']
     const i = Math.floor(Math.log(bytes) / Math.log(k))
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
   }
 
-  const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleString()
+  const formatDate = (timestamp?: number) => {
+    if (!timestamp) return ''
+    return new Date(timestamp).toLocaleDateString()
   }
 
   // Enhanced editing functionality
@@ -146,707 +205,255 @@ export function MemoryBrowserPanel() {
 
     setIsSaving(true)
     try {
+      // Determine workspace from selected file
+      const workspace = workspaces.find(ws => 
+        selectedMemoryFile.startsWith(ws.path) || 
+        ws.children?.some(f => f.path === selectedMemoryFile || selectedMemoryFile.startsWith(f.path))
+      )
+
       const response = await fetch(`/api/memory`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'save',
+          action: 'write',
           path: selectedMemoryFile,
-          content: editedContent
-        })
+          content: editedContent,
+          workspace: workspace?.id
+        }),
       })
 
-      const data = await response.json()
-      if (data.success) {
+      if (response.ok) {
         setMemoryContent(editedContent)
         setIsEditing(false)
         setEditedContent('')
-        // Refresh file tree to update file sizes
-        loadFileTree()
       } else {
-        alert(data.error || 'Failed to save file')
+        const error = await response.json()
+        alert(error.error || 'Failed to save file')
       }
     } catch (error) {
-      log.error('Failed to save file:', error)
+      log.error('Save failed:', error)
       alert('Network error occurred')
     } finally {
       setIsSaving(false)
     }
   }
 
-  const createNewFile = async (filePath: string, content: string = '') => {
-    try {
-      const response = await fetch(`/api/memory`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'create',
-          path: filePath,
-          content
-        })
-      })
-
-      const data = await response.json()
-      if (data.success) {
-        loadFileTree()
-        loadFileContent(filePath)
-      } else {
-        alert(data.error || 'Failed to create file')
-      }
-    } catch (error) {
-      log.error('Failed to create file:', error)
-      alert('Network error occurred')
-    }
-  }
-
-  const deleteFile = async () => {
-    if (!selectedMemoryFile) return
-
-    try {
-      const response = await fetch(`/api/memory`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'delete',
-          path: selectedMemoryFile
-        })
-      })
-
-      const data = await response.json()
-      if (data.success) {
-        setSelectedMemoryFile('')
-        setMemoryContent('')
-        setShowDeleteConfirm(false)
-        loadFileTree()
-      } else {
-        alert(data.error || 'Failed to delete file')
-      }
-    } catch (error) {
-      log.error('Failed to delete file:', error)
-      alert('Network error occurred')
-    }
-  }
-
-  const renderFileTree = (files: MemoryFile[], level = 0): React.ReactElement[] => {
+  const renderFileTree = (files: MemoryFile[], depth = 0, workspaceId?: string) => {
     return files.map((file) => (
-      <div key={file.path} style={{ marginLeft: `${level * 16}px` }}>
-        {file.type === 'directory' ? (
-          <div>
-            <div
-              className="flex items-center space-x-2 py-1 px-2 hover:bg-secondary rounded cursor-pointer"
-              onClick={() => toggleFolder(file.path)}
-            >
-              <span className="text-blue-400">
+      <div key={file.path} style={{ marginLeft: depth * 16 }}>
+        <div
+          className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer transition-colors ${
+            selectedMemoryFile === file.path
+              ? 'bg-primary/20 text-primary'
+              : 'hover:bg-secondary/50 text-foreground'
+          }`}
+          onClick={() => {
+            if (file.type === 'directory') {
+              toggleFolder(file.path)
+            } else {
+              loadFileContent(file.path, workspaceId)
+            }
+          }}
+        >
+          {file.type === 'directory' ? (
+            <>
+              <span className="text-muted-foreground">
                 {expandedFolders.has(file.path) ? '📂' : '📁'}
               </span>
-              <span className="text-foreground">{file.name}</span>
-              <span className="text-xs text-muted-foreground">
-                ({file.children?.length || 0} items)
-              </span>
-            </div>
-            {expandedFolders.has(file.path) && file.children && (
-              <div>
-                {renderFileTree(file.children, level + 1)}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div
-            className={`flex items-center space-x-2 py-1 px-2 hover:bg-secondary rounded cursor-pointer ${
-              selectedMemoryFile === file.path ? 'bg-primary/20 border border-primary/30' : ''
-            }`}
-            onClick={() => loadFileContent(file.path)}
-          >
-            <span className="text-muted-foreground">
-              {file.name.endsWith('.md') ? '📄' :
-               file.name.endsWith('.txt') ? '📝' :
-               file.name.endsWith('.json') ? '📋' : '📄'}
-            </span>
-            <span className="text-foreground flex-1">{file.name}</span>
-            <div className="flex flex-col text-xs text-muted-foreground text-right">
-              {file.size && <span>{formatFileSize(file.size)}</span>}
-              {file.modified && <span>{new Date(file.modified).toLocaleDateString()}</span>}
-            </div>
+              <span className="font-medium">{file.name}</span>
+            </>
+          ) : (
+            <>
+              <span className="text-muted-foreground">📄</span>
+              <span className="flex-1 truncate">{file.name}</span>
+              {file.size && (
+                <span className="text-xs text-muted-foreground">{formatFileSize(file.size)}</span>
+              )}
+            </>
+          )}
+        </div>
+        {file.type === 'directory' && expandedFolders.has(file.path) && file.children && (
+          <div className="mt-0.5">
+            {renderFileTree(file.children, depth + 1, workspaceId)}
           </div>
         )}
       </div>
     ))
   }
 
-  const renderInlineFormatting = (text: string): React.ReactNode[] => {
-    const parts: React.ReactNode[] = []
-    const regex = /(\*\*.*?\*\*|\*.*?\*)/g
-    let lastIndex = 0
-    let match: RegExpExecArray | null
-    let key = 0
-    while ((match = regex.exec(text)) !== null) {
-      if (match.index > lastIndex) {
-        parts.push(text.slice(lastIndex, match.index))
-      }
-      const m = match[0]
-      if (m.startsWith('**') && m.endsWith('**')) {
-        parts.push(<strong key={key++}>{m.slice(2, -2)}</strong>)
-      } else if (m.startsWith('*') && m.endsWith('*')) {
-        parts.push(<em key={key++}>{m.slice(1, -1)}</em>)
-      }
-      lastIndex = regex.lastIndex
-    }
-    if (lastIndex < text.length) {
-      parts.push(text.slice(lastIndex))
-    }
-    return parts
-  }
-
-  const renderMarkdown = (content: string) => {
-    // Improved markdown rendering with proper line handling
-    const lines = content.split('\n')
-    const elements: React.ReactElement[] = []
-    let inList = false
-    let seenHeaders = new Set<string>()
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const trimmedLine = line.trim()
-      
-      if (trimmedLine.startsWith('# ')) {
-        const headerText = trimmedLine.slice(2)
-        const headerId = `h1-${headerText.toLowerCase().replace(/\s+/g, '-')}`
-        
-        // Skip duplicate headers
-        if (seenHeaders.has(headerId)) continue
-        seenHeaders.add(headerId)
-        
-        if (inList) inList = false
-        elements.push(<h1 key={`${i}-${headerId}`} className="text-2xl font-bold mt-6 mb-3 text-primary">{headerText}</h1>)
-      } else if (trimmedLine.startsWith('## ')) {
-        const headerText = trimmedLine.slice(3)
-        const headerId = `h2-${headerText.toLowerCase().replace(/\s+/g, '-')}`
-        
-        // Skip duplicate headers
-        if (seenHeaders.has(headerId)) continue
-        seenHeaders.add(headerId)
-        
-        if (inList) inList = false
-        elements.push(<h2 key={`${i}-${headerId}`} className="text-xl font-semibold mt-5 mb-3 text-foreground">{headerText}</h2>)
-      } else if (trimmedLine.startsWith('### ')) {
-        const headerText = trimmedLine.slice(4)
-        const headerId = `h3-${headerText.toLowerCase().replace(/\s+/g, '-')}`
-        
-        // Skip duplicate headers
-        if (seenHeaders.has(headerId)) continue
-        seenHeaders.add(headerId)
-        
-        if (inList) inList = false
-        elements.push(<h3 key={`${i}-${headerId}`} className="text-lg font-semibold mt-4 mb-2 text-foreground">{headerText}</h3>)
-      } else if (trimmedLine.startsWith('- ')) {
-        if (inList) inList = false
-        elements.push(<li key={`${i}-li`} className="ml-6 mb-1 list-disc">{trimmedLine.slice(2)}</li>)
-      } else if (trimmedLine.startsWith('**') && trimmedLine.endsWith('**') && trimmedLine.length > 4) {
-        if (inList) inList = false
-        elements.push(<p key={`${i}-bold`} className="font-bold mb-2">{trimmedLine.slice(2, -2)}</p>)
-      } else if (trimmedLine === '') {
-        if (inList) inList = false
-        elements.push(<div key={`${i}-space`} className="mb-2"></div>)
-      } else if (trimmedLine.length > 0) {
-        if (inList) inList = false
-        elements.push(
-          <p key={`${i}-p`} className="mb-2">
-            {renderInlineFormatting(trimmedLine)}
-          </p>
-        )
-      }
-    }
-    
-    return elements
-  }
+  const displayWorkspaces = getDisplayFiles()
 
   return (
-    <div className="p-6 space-y-6">
-      <div className="border-b border-border pb-4">
-        <h1 className="text-3xl font-bold text-foreground">Memory Browser</h1>
-        <p className="text-muted-foreground mt-2">
-          {isLocal
-            ? 'Browse and manage local knowledge files and memory'
-            : 'Explore knowledge files and memory structure'}
-        </p>
-        <p className="text-xs text-muted-foreground mt-1">
-          This page shows all workspace memory files. The agent profile Memory tab only edits that single agent&apos;s working memory.
-        </p>
-        
-        {/* Tab Navigation */}
-        <div className="flex gap-2 mt-4">
-          <button
-            onClick={() => setActiveTab('all')}
-            className={`px-4 py-2 rounded font-medium transition-colors ${
-              activeTab === 'all' 
-                ? 'bg-primary text-primary-foreground' 
-                : 'bg-secondary text-foreground hover:bg-secondary/80'
-            }`}
+    <div className="h-full flex flex-col bg-background">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div>
+          <h1 className="text-xl font-semibold text-foreground">Memory Browser</h1>
+          <p className="text-sm text-muted-foreground">
+            {workspaces.length} agent workspaces
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Workspace Selector */}
+          <select
+            value={selectedWorkspace}
+            onChange={(e) => setSelectedWorkspace(e.target.value)}
+            className="px-3 py-1.5 bg-secondary border border-border rounded-md text-sm"
           >
-            📁 All Files
-          </button>
-          <button
-            onClick={() => setActiveTab('daily')}
-            className={`px-4 py-2 rounded font-medium transition-colors ${
-              activeTab === 'daily' 
-                ? 'bg-primary text-primary-foreground' 
-                : 'bg-secondary text-foreground hover:bg-secondary/80'
-            }`}
-          >
-            📅 Daily Logs
-          </button>
-          <button
-            onClick={() => setActiveTab('knowledge')}
-            className={`px-4 py-2 rounded font-medium transition-colors ${
-              activeTab === 'knowledge' 
-                ? 'bg-primary text-primary-foreground' 
-                : 'bg-secondary text-foreground hover:bg-secondary/80'
-            }`}
-          >
-            🧠 Knowledge
-          </button>
+            <option value="all">All Workspaces</option>
+            {workspaces.map((ws) => (
+              <option key={ws.id} value={ws.id}>
+                {ws.emoji} {ws.name}
+              </option>
+            ))}
+          </select>
+
+          {/* Tab Filter */}
+          <div className="flex bg-secondary rounded-lg p-0.5">
+            <button
+              onClick={() => setActiveTab('all')}
+              className={`px-3 py-1 rounded-md text-sm transition-colors ${
+                activeTab === 'all' ? 'bg-card shadow-sm' : 'text-muted-foreground'
+              }`}
+            >
+              All
+            </button>
+            <button
+              onClick={() => setActiveTab('daily')}
+              className={`px-3 py-1 rounded-md text-sm transition-colors ${
+                activeTab === 'daily' ? 'bg-card shadow-sm' : 'text-muted-foreground'
+              }`}
+            >
+              Daily
+            </button>
+            <button
+              onClick={() => setActiveTab('knowledge')}
+              className={`px-3 py-1 rounded-md text-sm transition-colors ${
+                activeTab === 'knowledge' ? 'bg-card shadow-sm' : 'text-muted-foreground'
+              }`}
+            >
+              Knowledge
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Search Bar */}
-      <div className="bg-card border border-border rounded-lg p-4">
-        <div className="flex space-x-4">
-          <div className="flex-1">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && searchFiles()}
-              placeholder="Search in memory files..."
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
-            />
-          </div>
-          <button
-            onClick={searchFiles}
-            disabled={isSearching || !searchQuery.trim()}
-            className="px-4 py-2 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {isSearching ? 'Searching...' : 'Search'}
-          </button>
-          <button
-            onClick={loadFileTree}
-            disabled={isLoading}
-            className="px-4 py-2 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-md font-medium hover:bg-blue-500/30 transition-colors disabled:opacity-50"
-          >
-            Refresh
-          </button>
-        </div>
-
-        {/* Search Results */}
-        {searchResults.length > 0 && (
-          <div className="mt-4 border-t border-border pt-4">
-            <h3 className="font-medium text-foreground mb-2">Search Results ({searchResults.length})</h3>
-            <div className="space-y-2 max-h-32 overflow-y-auto">
-              {searchResults.map((result, index) => (
-                <div
-                  key={index}
-                  className="flex items-center justify-between p-2 bg-secondary rounded cursor-pointer hover:bg-secondary/80"
-                  onClick={() => loadFileContent(result.path)}
-                >
-                  <div>
-                    <span className="font-medium text-foreground">{result.name}</span>
-                    <span className="text-sm text-muted-foreground ml-2">({result.path})</span>
-                  </div>
-                  <span className="text-xs text-muted-foreground">
-                    {result.matches} matches
-                  </span>
-                </div>
-              ))}
+      {/* Main Content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* File Tree Sidebar */}
+        <div className="w-80 border-r border-border overflow-y-auto p-3">
+          {/* Search */}
+          <div className="mb-3">
+            <div className="relative">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && searchFiles()}
+                placeholder="Search memory files..."
+                className="w-full px-3 py-2 pl-9 bg-secondary border border-border rounded-md text-sm"
+              />
+              <span className="absolute left-3 top-2.5 text-muted-foreground">🔍</span>
             </div>
           </div>
-        )}
-      </div>
 
-      <div className="grid lg:grid-cols-3 gap-6">
-        {/* File Tree */}
-        <div className="bg-card border border-border rounded-lg p-6">
-          <h2 className="text-xl font-semibold mb-4">Memory Structure</h2>
-          
+          {/* File Tree */}
           {isLoading ? (
-            <div className="flex items-center justify-center h-32">
-              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
-              <span className="ml-3 text-muted-foreground">Loading...</span>
+            <div className="flex items-center justify-center py-8">
+              <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
             </div>
           ) : (
-            <div className="max-h-96 overflow-y-auto text-sm">
-              {getFilteredFiles().length === 0 ? (
-                <div className="text-center text-muted-foreground py-8">
-                  {activeTab === 'all' ? 'No memory files found' : 
-                   activeTab === 'daily' ? 'No daily logs found' : 
-                   'No knowledge files found'}
+            <div className="space-y-4">
+              {displayWorkspaces.map((workspace) => (
+                <div key={workspace.id} className="border border-border rounded-lg overflow-hidden">
+                  {/* Workspace Header */}
+                  <button
+                    onClick={() => toggleFolder(workspace.path)}
+                    className="w-full flex items-center gap-2 px-3 py-2 bg-secondary/50 hover:bg-secondary transition-colors"
+                  >
+                    <span>{expandedFolders.has(workspace.path) ? '📂' : '📁'}</span>
+                    <span className="font-semibold">{workspace.emoji} {workspace.name}</span>
+                    <span className="text-xs text-muted-foreground ml-auto">
+                      {workspace.children?.length || 0} files
+                    </span>
+                  </button>
+                  
+                  {/* Workspace Files */}
+                  {expandedFolders.has(workspace.path) && workspace.children && (
+                    <div className="p-2 bg-card">
+                      {renderFileTree(workspace.children, 0, workspace.id)}
+                    </div>
+                  )}
                 </div>
-              ) : (
-                renderFileTree(getFilteredFiles())
-              )}
+              ))}
             </div>
           )}
         </div>
 
-        {/* File Content */}
-        <div className="lg:col-span-2 bg-card border border-border rounded-lg p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold">
-              {selectedMemoryFile || 'File Content'}
-            </h2>
-            <div className="flex items-center gap-2">
-              {selectedMemoryFile && (
-                <>
+        {/* Content Viewer */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {selectedMemoryFile ? (
+            <>
+              {/* File Header */}
+              <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-secondary/30">
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">📄</span>
+                  <span className="font-medium">{selectedMemoryFile}</span>
+                </div>
+                <div className="flex items-center gap-2">
                   {!isEditing ? (
-                    <>
-                      <button
-                        onClick={startEditing}
-                        className="px-3 py-1 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-md text-sm hover:bg-blue-500/30 transition-smooth"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => setShowDeleteConfirm(true)}
-                        className="px-3 py-1 bg-red-500/20 text-red-400 border border-red-500/30 rounded-md text-sm hover:bg-red-500/30 transition-smooth"
-                      >
-                        Delete
-                      </button>
-                    </>
+                    <button
+                      onClick={startEditing}
+                      className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm hover:bg-primary/90 transition-colors"
+                    >
+                      Edit
+                    </button>
                   ) : (
                     <>
                       <button
-                        onClick={saveFile}
-                        disabled={isSaving}
-                        className="px-3 py-1 bg-green-500/20 text-green-400 border border-green-500/30 rounded-md text-sm hover:bg-green-500/30 disabled:opacity-50 transition-smooth"
-                      >
-                        {isSaving ? 'Saving...' : 'Save'}
-                      </button>
-                      <button
                         onClick={cancelEditing}
-                        className="px-3 py-1 bg-secondary text-muted-foreground rounded-md text-sm hover:bg-secondary/80 transition-smooth"
+                        className="px-3 py-1.5 bg-secondary text-foreground rounded-md text-sm hover:bg-secondary/80 transition-colors"
                       >
                         Cancel
                       </button>
+                      <button
+                        onClick={saveFile}
+                        disabled={isSaving}
+                        className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm hover:bg-primary/90 transition-colors disabled:opacity-50"
+                      >
+                        {isSaving ? 'Saving...' : 'Save'}
+                      </button>
                     </>
                   )}
-                  <button
-                    onClick={() => {
-                      setSelectedMemoryFile('')
-                      setMemoryContent('')
-                      setIsEditing(false)
-                      setEditedContent('')
-                    }}
-                    className="text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    Close
-                  </button>
-                </>
-              )}
-              <button
-                onClick={() => setShowCreateModal(true)}
-                className="px-3 py-1 bg-primary text-primary-foreground rounded text-sm hover:bg-primary/90 transition-colors"
-              >
-                + New File
-              </button>
-            </div>
-          </div>
-          
-          <div className="border border-border rounded-lg min-h-96 overflow-auto">
-            {isLoading ? (
-              <div className="flex items-center justify-center h-32">
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
-                <span className="ml-3 text-muted-foreground">Loading file...</span>
+                </div>
               </div>
-            ) : memoryContent !== null ? (
-              <div className="p-4 w-full">
+
+              {/* File Content */}
+              <div className="flex-1 overflow-auto p-4">
                 {isEditing ? (
                   <textarea
                     value={editedContent}
                     onChange={(e) => setEditedContent(e.target.value)}
-                    className="w-full min-h-[500px] p-3 bg-surface-1 text-foreground font-mono text-sm border border-border rounded-md resize-none focus:outline-none focus:ring-1 focus:ring-primary/50"
-                    placeholder="Edit file content..."
+                    className="w-full h-full min-h-[400px] p-4 bg-card border border-border rounded-lg font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    spellCheck={false}
                   />
-                ) : selectedMemoryFile?.endsWith('.md') ? (
-                  <div className="prose prose-invert max-w-none w-full">
-                    <div className="mb-4 text-sm text-muted-foreground">
-                      File: {selectedMemoryFile} | Size: {memoryContent.length} chars
-                    </div>
-                    <div className="whitespace-pre-wrap break-words">
-                      {renderMarkdown(memoryContent)}
-                    </div>
-                  </div>
-                ) : selectedMemoryFile?.endsWith('.json') ? (
-                  <div>
-                    <div className="mb-4 text-sm text-muted-foreground">
-                      File: {selectedMemoryFile} | Size: {memoryContent.length} chars
-                    </div>
-                    <pre className="text-sm overflow-auto whitespace-pre-wrap break-words">
-                      <code>{JSON.stringify(JSON.parse(memoryContent), null, 2)}</code>
-                    </pre>
-                  </div>
                 ) : (
-                  <div>
-                    <div className="mb-4 text-sm text-muted-foreground">
-                      File: {selectedMemoryFile} | Size: {memoryContent.length} chars
-                    </div>
-                    <pre className="text-sm whitespace-pre-wrap break-words overflow-auto">
+                  <div className="prose prose-sm dark:prose-invert max-w-none">
+                    <pre className="whitespace-pre-wrap font-mono text-sm bg-card p-4 rounded-lg border border-border">
                       {memoryContent}
                     </pre>
                   </div>
                 )}
               </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
-                <span>Select a file to view its content</span>
-                <button
-                  onClick={() => setShowCreateModal(true)}
-                  className="mt-4 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors"
-                >
-                  Create New File
-                </button>
+            </>
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-muted-foreground">
+              <div className="text-center">
+                <span className="text-4xl mb-4 block">📄</span>
+                <p>Select a file to view its contents</p>
               </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* File Stats */}
-      {memoryFiles.length > 0 && (
-        <div className="bg-card border border-border rounded-lg p-6">
-          <h2 className="text-xl font-semibold mb-4">Memory Statistics</h2>
-          
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-secondary rounded p-4">
-              <div className="text-2xl font-bold text-foreground">
-                {memoryFiles.reduce((count, dir) => {
-                  const countFiles = (files: MemoryFile[]): number => {
-                    return files.reduce((acc, file) => {
-                      if (file.type === 'file') return acc + 1
-                      return acc + countFiles(file.children || [])
-                    }, 0)
-                  }
-                  return count + countFiles([dir])
-                }, 0)}
-              </div>
-              <div className="text-sm text-muted-foreground">Total Files</div>
             </div>
-
-            <div className="bg-secondary rounded p-4">
-              <div className="text-2xl font-bold text-foreground">
-                {memoryFiles.reduce((count, dir) => {
-                  const countDirs = (files: MemoryFile[]): number => {
-                    return files.reduce((acc, file) => {
-                      if (file.type === 'directory') return acc + 1 + countDirs(file.children || [])
-                      return acc
-                    }, 0)
-                  }
-                  return count + countDirs([dir])
-                }, 0)}
-              </div>
-              <div className="text-sm text-muted-foreground">Directories</div>
-            </div>
-
-            <div className="bg-secondary rounded p-4">
-              <div className="text-2xl font-bold text-foreground">
-                {formatFileSize(memoryFiles.reduce((size, dir) => {
-                  const calculateSize = (files: MemoryFile[]): number => {
-                    return files.reduce((acc, file) => {
-                      if (file.type === 'file' && file.size) return acc + file.size
-                      return acc + calculateSize(file.children || [])
-                    }, 0)
-                  }
-                  return size + calculateSize([dir])
-                }, 0))}
-              </div>
-              <div className="text-sm text-muted-foreground">Total Size</div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Create File Modal */}
-      {showCreateModal && (
-        <CreateFileModal
-          onClose={() => setShowCreateModal(false)}
-          onCreate={createNewFile}
-        />
-      )}
-
-      {/* Delete Confirmation Modal */}
-      {showDeleteConfirm && selectedMemoryFile && (
-        <DeleteConfirmModal
-          fileName={selectedMemoryFile}
-          onClose={() => setShowDeleteConfirm(false)}
-          onConfirm={deleteFile}
-        />
-      )}
-    </div>
-  )
-}
-
-// Create File Modal Component
-function CreateFileModal({
-  onClose,
-  onCreate
-}: {
-  onClose: () => void
-  onCreate: (path: string, content: string) => void
-}) {
-  const [fileName, setFileName] = useState('')
-  const [filePath, setFilePath] = useState('knowledge/')
-  const [initialContent, setInitialContent] = useState('')
-  const [fileType, setFileType] = useState('md')
-
-  const handleCreate = () => {
-    if (!fileName.trim()) {
-      alert('Please enter a file name')
-      return
-    }
-
-    const fullPath = filePath + fileName + '.' + fileType
-    onCreate(fullPath, initialContent)
-    onClose()
-  }
-
-  const fileTypesWithTemplates = {
-    md: '# New Document\n\n## Overview\n\n## Details\n\n',
-    json: '{\n  "name": "",\n  "description": "",\n  "data": {}\n}',
-    txt: '',
-    log: `[${new Date().toISOString()}] Log entry\n`
-  }
-
-  return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-lg max-w-md w-full p-6 shadow-xl">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-bold text-foreground">Create New File</h3>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground text-xl transition-smooth">×</button>
-        </div>
-
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-2">Directory Path</label>
-            <select
-              value={filePath}
-              onChange={(e) => setFilePath(e.target.value)}
-              className="w-full px-3 py-2 bg-surface-1 border border-border rounded-md text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
-            >
-              <option value="knowledge-base/">knowledge-base/</option>
-              <option value="memory/">memory/</option>
-              <option value="knowledge/">knowledge/</option>
-              <option value="daily/">daily/</option>
-              <option value="logs/">logs/</option>
-              <option value="reference/">reference/</option>
-              <option value="templates/">templates/</option>
-              <option value="">root/</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-2">File Name</label>
-            <input
-              type="text"
-              value={fileName}
-              onChange={(e) => setFileName(e.target.value)}
-              placeholder="my-new-file"
-              className="w-full px-3 py-2 bg-surface-1 border border-border rounded-md text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-2">File Type</label>
-            <select
-              value={fileType}
-              onChange={(e) => {
-                setFileType(e.target.value)
-                setInitialContent(fileTypesWithTemplates[e.target.value as keyof typeof fileTypesWithTemplates] || '')
-              }}
-              className="w-full px-3 py-2 bg-surface-1 border border-border rounded-md text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
-            >
-              <option value="md">Markdown (.md)</option>
-              <option value="json">JSON (.json)</option>
-              <option value="txt">Text (.txt)</option>
-              <option value="log">Log (.log)</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-2">Initial Content (optional)</label>
-            <textarea
-              value={initialContent}
-              onChange={(e) => setInitialContent(e.target.value)}
-              className="w-full h-24 px-3 py-2 bg-surface-1 border border-border rounded-md text-foreground placeholder-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50 resize-none font-mono text-sm"
-              placeholder="Template content will be auto-filled..."
-            />
-          </div>
-
-          <div className="bg-surface-1 p-3 rounded-md text-sm text-muted-foreground border border-border/50">
-            <strong className="text-foreground">Full Path:</strong> {filePath}{fileName}.{fileType}
-          </div>
-
-          <div className="flex gap-3 pt-4">
-            <button
-              onClick={handleCreate}
-              disabled={!fileName.trim()}
-              className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-smooth"
-            >
-              Create File
-            </button>
-            <button
-              onClick={onClose}
-              className="px-4 py-2 bg-secondary text-muted-foreground rounded-md hover:bg-secondary/80 transition-smooth"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// Delete Confirmation Modal Component
-function DeleteConfirmModal({
-  fileName,
-  onClose,
-  onConfirm
-}: {
-  fileName: string
-  onClose: () => void
-  onConfirm: () => void
-}) {
-  return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-lg max-w-md w-full p-6 shadow-xl">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-bold text-red-400">Confirm Deletion</h3>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground text-xl transition-smooth">×</button>
-        </div>
-
-        <div className="space-y-4">
-          <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-lg">
-            <p className="text-sm">You are about to permanently delete:</p>
-            <p className="font-mono text-foreground mt-2 bg-surface-1 p-2 rounded-md text-sm">
-              {fileName}
-            </p>
-            <p className="text-xs mt-2 text-red-400/70">
-              This action cannot be undone.
-            </p>
-          </div>
-
-          <div className="flex gap-3 pt-4">
-            <button
-              onClick={onConfirm}
-              className="flex-1 px-4 py-2 bg-red-500/20 text-red-400 border border-red-500/30 rounded-md hover:bg-red-500/30 transition-smooth"
-            >
-              Delete Permanently
-            </button>
-            <button
-              onClick={onClose}
-              className="px-4 py-2 bg-secondary text-muted-foreground rounded-md hover:bg-secondary/80 transition-smooth"
-            >
-              Cancel
-            </button>
-          </div>
+          )}
         </div>
       </div>
     </div>

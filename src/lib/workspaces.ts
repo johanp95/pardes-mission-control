@@ -183,12 +183,19 @@ export function discoverWorkspaces(): WorkspaceInfo[] {
     const relativePath = path.relative(config.openclawStateDir, info.workspace)
     const memoryPath = path.join(info.workspace, 'memory')
     
+    // Only include workspaces that have a memory directory
+    // This prevents showing git files, SOUL.md, etc. as "memory"
+    if (!fs.existsSync(memoryPath)) {
+      logger.debug(`Skipping ${agentId}: no memory directory`)
+      continue
+    }
+    
     workspaces.push({
       id: agentId,
       name: info.identity?.name || agentId,
       emoji: info.identity?.emoji,
       workspacePath: info.workspace,
-      memoryPath: fs.existsSync(memoryPath) ? memoryPath : info.workspace,
+      memoryPath: memoryPath,
       relativePath,
       isDefault: agentId === 'main' || relativePath === 'workspace'
     })
