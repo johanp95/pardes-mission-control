@@ -222,7 +222,12 @@ const agentsInConfig: OpenClawAgent[] = config.agents?.list || []
    - ~~Replace hardcoded MODEL_CATALOG~~
    - **Status:** Complete - API returns 4 moonshot models, spawn panel uses real config
 
-3. **Fix gateway health check**
+3. **✅ DONE: Pipeline panel wiring**
+   - ~~Add to NavRail~~
+   - ~~Add to ContentRouter~~
+   - **Status:** Complete — accessible at /pipelines (shows 0 pipelines currently)
+
+4. **Fix gateway health check**
    - Implement actual WebSocket ping
    - Store latency in DB
    - Update UI with real status
