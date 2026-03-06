@@ -78,14 +78,14 @@ export function DocumentsPanel() {
     setLoadingTree(true)
     setTreeError(null)
     try {
-      // Use the workspace-aware memory API
-      const res = await fetch('/api/memory?action=tree')
+      // Use the documents-specific API (shows workspace files, not memory)
+      const res = await fetch('/api/docs/tree')
       const data = await res.json()
       
       if (!res.ok) throw new Error(data.error || 'Failed to load documents')
 
       if (data.unified && Array.isArray(data.tree)) {
-        // New multi-workspace format
+        // Multi-workspace format
         setWorkspaces(data.tree)
         // Auto-expand all workspaces
         const allPaths = new Set<string>()
@@ -94,16 +94,9 @@ export function DocumentsPanel() {
         })
         setExpandedDirs(allPaths)
       } else if (Array.isArray(data.tree)) {
-        // Legacy format
-        setWorkspaces([{
-          id: 'legacy',
-          name: 'Documents',
-          path: 'docs',
-          hasMemory: true,
-          children: data.tree,
-          modified: Date.now()
-        }])
-        setExpandedDirs(new Set(['docs']))
+        // Legacy or single workspace format
+        setWorkspaces(data.tree)
+        setExpandedDirs(new Set(data.tree.map((ws: WorkspaceWithDocs) => ws.path)))
       }
     } catch (error) {
       setWorkspaces([])
@@ -122,7 +115,7 @@ export function DocumentsPanel() {
     setDocError(null)
     try {
       const wsParam = workspaceId ? `&workspace=${encodeURIComponent(workspaceId)}` : ''
-      const res = await fetch(`/api/memory?action=content&path=${encodeURIComponent(path)}${wsParam}`)
+      const res = await fetch(`/api/docs/content?path=${encodeURIComponent(path)}${wsParam}`)
       const data = (await res.json()) as DocsContentResponse
       if (!res.ok) throw new Error(data.error || 'Failed to load document')
 
