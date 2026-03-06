@@ -46,6 +46,7 @@ const navGroups: NavGroup[] = [
     label: 'AUTOMATE',
     items: [
       { id: 'cron', label: 'Cron', icon: <CronIcon />, priority: false },
+      { id: 'pipelines', label: 'Pipelines', icon: <PipelinesIcon />, priority: false },
       { id: 'spawn', label: 'Spawn', icon: <SpawnIcon />, priority: false, requiresGateway: true },
       { id: 'webhooks', label: 'Webhooks', icon: <WebhookIcon />, priority: false },
       { id: 'alerts', label: 'Alerts', icon: <AlertIcon />, priority: false },
@@ -481,6 +482,15 @@ function CronIcon() {
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="8" cy="8" r="6.5" />
       <path d="M8 4v4l2.5 2.5" />
+    </svg>
+  )
+}
+
+function PipelinesIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 4h3v3H2zM6.5 4h3v3h-3zM11 4h3v3h-3zM2 9h3v3H2zM6.5 9h3v3h-3zM11 9h3v3h-3z" />
+      <path d="M5 5.5h1.5M9.5 5.5H11M5 10.5h1.5M9.5 10.5H11" />
     </svg>
   )
 }

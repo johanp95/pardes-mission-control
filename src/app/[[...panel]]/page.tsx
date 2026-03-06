@@ -33,6 +33,7 @@ import { SuperAdminPanel } from '@/components/panels/super-admin-panel'
 import { OfficePanel } from '@/components/panels/office-panel'
 import { GitHubSyncPanel } from '@/components/panels/github-sync-panel'
 import { DocumentsPanel } from '@/components/panels/documents-panel'
+import { PipelineTab } from '@/components/panels/pipeline-tab'
 import { ChatPanel } from '@/components/chat/chat-panel'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { LocalModeBanner } from '@/components/layout/local-mode-banner'
@@ -239,6 +240,8 @@ function ContentRouter({ tab }: { tab: string }) {
       return <LogViewerPanel />
     case 'cron':
       return <CronManagementPanel />
+    case 'pipelines':
+      return <PipelineTab />
     case 'memory':
       return <MemoryBrowserPanel />
     case 'tokens':
