@@ -75,6 +75,13 @@ export function MultiGatewayPanel() {
 
   useEffect(() => { fetchGateways(); fetchDirectConnections() }, [fetchGateways, fetchDirectConnections])
 
+  // Auto-probe gateways on mount and every 30 seconds
+  useEffect(() => {
+    probeAll()
+    const interval = setInterval(probeAll, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
   const setPrimary = async (gw: Gateway) => {
     await fetch('/api/gateways', {
       method: 'PUT',
